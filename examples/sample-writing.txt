@@ -1,0 +1,19 @@
+Post-Mortem: The 3 AM Lockup on Ingestion Node 4
+
+Here is what actually happened during Tuesday's outage. No sugarcoating.
+
+At 02:45 UTC, our primary Kafka consumer group stalled. Monitoring fired off three P1 alerts. The initial impulse from the night shift was to restart the ingestion container and hope the backpressure resolved itself. 
+
+I don't reboot and pray. That solves nothing; it just resets memory and hides the crime scene.
+
+I pulled the dmesg buffer, ran perf top, and looked at disk I/O metrics. The problem wasn't Kafka, and it wasn't network packet loss. It was an unindexed batch query in our PostgreSQL consumer worker. Every time the worker ingested a 10,000-event batch, it triggered a full table scan across 48 million rows. That locked the thread pool, saturated our NVMe write queues, and spiked our p99 latency from 32ms straight to 4.8 seconds.
+
+Here is what we did to fix it:
+1. Killed the blocking transaction immediately.
+2. Created a partial composite index on (tenant_id, created_at) where status = 'pending'.
+3. Rewrote the batch ingestion query to lock only the relevant row IDs using FOR UPDATE SKIP LOCKED.
+4. Tuned the Postgres WAL buffer size from 16MB to 64MB to eliminate checkpoint stalls.
+
+Within twelve minutes, the consumer lag dropped to zero. Total downtime was 14 minutes. We didn't lose a single write.
+
+The lesson here is simple. Stop building complex distributed retries before you check basic disk I/O and database indices. Operational simplicity beats architectural cleverness every single time.
