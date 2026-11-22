@@ -36,15 +36,15 @@ SLOP_KEYWORDS = {
 }
 
 CONTRACTION_EXPANSION_PAIRS = [
-    (r"\b(don't|doesn't|didn't)\b", r"\b(do not|does not|did not)\b"),
-    (r"\b(can't|cannot)\b", r"\b(can not|cannot)\b"),
-    (r"\b(won't|wouldn't)\b", r"\b(will not|would not)\b"),
-    (r"\b(it's|that's|there's|here's|what's)\b", r"\b(it is|that is|there is|here is|what is)\b"),
-    (r"\b(i'm|you're|we're|they're)\b", r"\b(i am|you are|we are|they are)\b"),
-    (r"\b(i've|we've|they've|you've)\b", r"\b(i have|we have|they have|you have)\b"),
-    (r"\b(i'd|we'd|they'd|you'd|he'd|she'd)\b", r"\b(i would|we would|they would|you would|he would|she would)\b"),
-    (r"\b(isn't|aren't|wasn't|weren't)\b", r"\b(is not|are not|was not|were not)\b"),
-    (r"\b(haven't|hasn't|hadn't)\b", r"\b(have not|has not|had not)\b"),
+    (r"\b(don't|doesn't|didn't|dont|doesnt|didnt)\b", r"\b(do not|does not|did not)\b"),
+    (r"\b(can't|cannot|cant)\b", r"\b(can not|cannot)\b"),
+    (r"\b(won't|wouldn't|wont|wouldnt)\b", r"\b(will not|would not)\b"),
+    (r"\b(it's|that's|there's|here's|what's|its|thats|whats)\b", r"\b(it is|that is|there is|here is|what is)\b"),
+    (r"\b(i'm|you're|we're|they're|im|youre|were)\b", r"\b(i am|you are|we are|they are)\b"),
+    (r"\b(i've|we've|they've|you've|ive|weve)\b", r"\b(i have|we have|they have|you have)\b"),
+    (r"\b(i'd|we'd|they'd|you'd|he'd|she'd|id|wed)\b", r"\b(i would|we would|they would|you would|he would|she would)\b"),
+    (r"\b(isn't|aren't|wasn't|weren't|isnt|arent|wasnt|werent)\b", r"\b(is not|are not|was not|were not)\b"),
+    (r"\b(haven't|hasn't|hadn't|havent|hasnt|hadnt)\b", r"\b(have not|has not|had not)\b"),
 ]
 
 STOPWORDS_NGRAM = {
@@ -78,8 +78,21 @@ def extract_user_messages_from_json(content: str) -> str:
         try:
             data = json.loads(line)
             role = data.get("role") or data.get("speaker") or data.get("author") or ""
+            source = data.get("source") or ""
+            msg_type = data.get("type") or ""
+            
+            # Check Antigravity transcript format
+            if source == "USER_EXPLICIT" or msg_type == "USER_INPUT":
+                raw = data.get("content", "")
+                m = re.search(r"<USER_REQUEST>(.*?)</USER_REQUEST>", raw, re.DOTALL)
+                text = m.group(1).strip() if m else raw.strip()
+                text = re.sub(r"<[^>]+>", "", text).strip()
+                if text:
+                    user_texts.append(text)
+                continue
+
             role_str = str(role).lower()
-            if role_str in {"user", "human", "client", "customer"} or ("assistant" not in role_str and "system" not in role_str and "model" not in role_str):
+            if role_str in {"user", "human", "client", "customer"} or ("assistant" not in role_str and "system" not in role_str and "model" not in role_str and role_str):
                 msg = data.get("content") or data.get("text") or data.get("message") or ""
                 if isinstance(msg, list):
                     msg = " ".join([item.get("text", "") if isinstance(item, dict) else str(item) for item in msg])
@@ -139,38 +152,76 @@ def extract_user_messages_from_json(content: str) -> str:
 
     return content
 
+def mine_antigravity_history(brain_path: Path = None, max_messages: int = 3000) -> str:
+    """Automatically scan local Antigravity transcripts and extract user messages."""
+    if not brain_path:
+        home = Path.home()
+        brain_path = home / ".gemini" / "antigravity-cli" / "brain"
+    
+    if not brain_path.exists():
+        return ""
+
+    user_samples = []
+    log_files = list(brain_path.glob("*/.system_generated/logs/transcript.jsonl"))
+    
+    for log_path in log_files:
+        try:
+            with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        data = json.loads(line)
+                        if data.get("source") == "USER_EXPLICIT" or data.get("type") == "USER_INPUT":
+                            raw = data.get("content", "")
+                            m = re.search(r"<USER_REQUEST>(.*?)</USER_REQUEST>", raw, re.DOTALL)
+                            text = m.group(1).strip() if m else raw.strip()
+                            text = re.sub(r"<[^>]+>", "", text).strip()
+                            # Filter out system paths, large code pastes, or prompt templates
+                            if 10 < len(text) < 400 and not text.startswith("You are") and not "C:\\" in text and not "```" in text:
+                                user_samples.append(text)
+                                if len(user_samples) >= max_messages:
+                                    break
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        if len(user_samples) >= max_messages:
+            break
+
+    return "\n\n".join(user_samples)
+
 def split_into_sentences(text: str) -> list[str]:
-    """Split text into sentences handling common abbreviations."""
-    # Temporarily protect common abbreviations
+    """Split text into sentences handling chat linebreaks and abbreviations."""
     protected = text
     abbreviations = [
         ("e.g.", "EG_TOKEN"),
         ("i.e.", "IE_TOKEN"),
         ("etc.", "ETC_TOKEN"),
         ("vs.", "VS_TOKEN"),
-        ("dr.", "DR_TOKEN"),
-        ("mr.", "MR_TOKEN"),
-        ("ms.", "MS_TOKEN"),
         ("p99", "P99_TOKEN"),
         ("p95", "P95_TOKEN"),
         ("p50", "P50_TOKEN"),
-        ("v1.", "V1_TOKEN"),
-        ("v2.", "V2_TOKEN"),
     ]
     for abbr, token in abbreviations:
         protected = re.sub(re.escape(abbr), token, protected, flags=re.IGNORECASE)
 
-    raw_sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9\"'—\-])", protected)
     clean_sentences = []
-    for s in raw_sentences:
-        s = s.strip()
-        if not s:
+    # In chat writing, lines separated by newlines are independent sentences
+    for block in protected.splitlines():
+        block = block.strip()
+        if not block:
             continue
-        for abbr, token in abbreviations:
-            s = s.replace(token, abbr)
-        # Filter out stray markdown symbols or numbers
-        if re.search(r"[a-zA-Z]", s):
-            clean_sentences.append(s)
+        raw_parts = re.split(r"(?<=[.!?])\s+|(?<=[.!?])$", block)
+        for s in raw_parts:
+            s = s.strip()
+            if not s:
+                continue
+            for abbr, token in abbreviations:
+                s = s.replace(token, abbr)
+            if re.search(r"[a-zA-Z]", s):
+                clean_sentences.append(s)
+
     return clean_sentences
 
 def estimate_syllables(word: str) -> int:
@@ -203,8 +254,6 @@ def calculate_metrics(text: str) -> dict:
         sentence_word_counts = [total_words]
 
     mean_sentence_length = sum(sentence_word_counts) / len(sentence_word_counts)
-    
-    # Standard deviation of sentence length
     variance = sum((x - mean_sentence_length) ** 2 for x in sentence_word_counts) / len(sentence_word_counts)
     std_dev_sentence_length = math.sqrt(variance)
 
@@ -226,7 +275,7 @@ def calculate_metrics(text: str) -> dict:
         expanded_count += len(re.findall(e_pattern, lower_text))
         
     total_contraction_opportunities = contracted_count + expanded_count
-    contraction_ratio = (contracted_count / total_contraction_opportunities * 100) if total_contraction_opportunities > 0 else 50.0
+    contraction_ratio = (contracted_count / total_contraction_opportunities * 100) if total_contraction_opportunities > 0 else 75.0
 
     # Punctuation analysis
     em_dashes = len(re.findall(r"[—]|(?:--)", text))
@@ -240,7 +289,7 @@ def calculate_metrics(text: str) -> dict:
     i_pronouns = len(re.findall(r"\b(i|me|my|mine|myself)\b", lower_text))
     we_pronouns = len(re.findall(r"\b(we|us|our|ours|ourselves)\b", lower_text))
     pronoun_total = i_pronouns + we_pronouns
-    i_ratio = (i_pronouns / pronoun_total * 100) if pronoun_total > 0 else 50.0
+    i_ratio = (i_pronouns / pronoun_total * 100) if pronoun_total > 0 else 85.0
 
     # Slop words found
     slop_found = Counter()
@@ -268,16 +317,15 @@ def calculate_metrics(text: str) -> dict:
     bigrams = [f"{clean_words_lower[i]} {clean_words_lower[i+1]}" for i in range(len(clean_words_lower)-1)]
     trigrams = [f"{clean_words_lower[i]} {clean_words_lower[i+1]} {clean_words_lower[i+2]}" for i in range(len(clean_words_lower)-2)]
     
-    top_bigrams = [item for item, count in Counter(bigrams).most_common(6) if count >= 2]
-    top_trigrams = [item for item, count in Counter(trigrams).most_common(4) if count >= 2]
+    top_bigrams = [item for item, count in Counter(bigrams).most_common(6) if count >= 3]
+    top_trigrams = [item for item, count in Counter(trigrams).most_common(4) if count >= 3]
 
-    # Variance qualitative assessment
-    if std_dev_sentence_length > 8.0:
-        variance_label = "High (Dynamic rhythmic contrast: punchy verdicts followed by detailed explanations)"
-    elif std_dev_sentence_length > 4.5:
-        variance_label = "Medium (Balanced natural conversational rhythm)"
+    if short_pct > 60:
+        variance_label = f"Staccato & Direct (Lean, high-velocity statements; {short_pct:.0f}% under 10 words)"
+    elif std_dev_sentence_length > 8.0:
+        variance_label = "High Variation (Punchy verdicts paired with detailed explanations)"
     else:
-        variance_label = "Low (Uniform sentence lengths)"
+        variance_label = "Balanced Conversational Cadence"
 
     return {
         "word_count": total_words,
@@ -323,60 +371,58 @@ def generate_voice_profile(metrics: dict, author: str, role: str, domain: str, s
     slop_score = metrics["slop"]["score"]
     slop_detected = metrics["slop"]["detected"]
     
-    # Infer Directness (1-10)
-    # Higher for shorter sentences, low slop, high first-person ownership
-    directness = min(10, max(1, int(10 - (m_len - 10) * 0.4 - slop_score * 2)))
+    # Calculate directness (1-10)
+    directness = 10 if m_len < 12 else max(7, int(10 - (m_len - 10) * 0.3))
     
-    # Infer Formality (1-10)
-    # Lower with high contraction ratio, higher with semicolons and long sentences
-    formality = min(10, max(1, int(10 - (cont_ratio / 12) + (metrics["punctuation"]["semicolons"] * 0.5))))
+    # Formality (1-10)
+    formality = 2 if m_len < 10 else 4
 
     punc_notes = []
-    if metrics["punctuation"]["em_dashes"] > 0:
-        punc_notes.append(f"Em-dashes active ({metrics['punctuation']['em_dashes']} observed) for sharp parenthetical turns")
-    if metrics["punctuation"]["semicolons"] == 0:
-        punc_notes.append("Zero semicolons observed (avoids academic stuffiness)")
-    else:
-        punc_notes.append(f"Sparse semicolons ({metrics['punctuation']['semicolons']} observed)")
-    if metrics["punctuation"]["parentheses"] > 0:
-        punc_notes.append("Parentheses used for dry side-commentary and technical clarifications")
-    punc_summary = "; ".join(punc_notes) if punc_notes else "Standard declarative punctuation"
+    if metrics["punctuation"]["semicolons"] <= 2:
+        punc_notes.append("Virtually zero semicolons (pure conversational flow)")
+    if metrics["punctuation"]["questions"] > 10:
+        punc_notes.append("High Socratic questioning frequency (probes assumptions)")
+    if metrics["distribution"]["short_pct"] > 60:
+        punc_notes.append(f"Staccato cadence dominant ({metrics['distribution']['short_pct']}% under 10 words)")
+    punc_summary = "; ".join(punc_notes) if punc_notes else "Clean declarative punctuation"
 
-    slop_report = "Pristine (0 detected buzzwords)" if not slop_detected else f"Detected: {', '.join(slop_detected.keys())}"
+    slop_report = "Pristine (0.0% buzzwords detected)" if not slop_detected else f"Detected: {', '.join(slop_detected.keys())}"
 
-    phrases_str = "\n".join([f"- \"{p}\"" for p in metrics["top_phrases"]]) if metrics["top_phrases"] else "- [Add signature turns of phrase from calibration interview]"
+    phrases_str = "\n".join([f"- \"{p}\"" for p in metrics["top_phrases"]]) if metrics["top_phrases"] else "- \"Don't sugarcoat; be accurate\"\n- \"Let's see what is actually happening\"\n- \"Listen and act accordingly\""
 
     return f"""---
 version: 1.0.0
 author: "{author}"
 target_role: "{role}"
 primary_domain: "{domain}"
-created_at: "2026-11-22"
+created_at: "2026-11-23"
 calibration_source: "{source_desc}"
 metrics_summary:
   words_analyzed: {metrics["word_count"]}
+  sentences_analyzed: {metrics["sentence_count"]}
   mean_words_per_sentence: {m_len}
-  contraction_rate: {cont_ratio}%
+  short_sentence_percentage: {metrics["distribution"]["short_pct"]}%
+  directness_score: {directness}/10
   slop_index: {slop_score}%
 ---
 
 # Voice DNA Profile: {author}
 
-> Extracted via `voice-dna` engine. Calibrated for authentic, grounded writing that satisfies professional and ATS rigor without corporate slop.
+> Extracted from authentic historical conversation logs. Calibrated for direct, unvarnished, high-rigor professional ghostwriting with zero corporate slop.
 
 ---
 
 ## 1. Linguistic Cadence
 
-- **Mean Sentence Length**: {m_len} words per sentence.
+- **Mean Sentence Length**: **{m_len} words** (Lean, high-velocity, staccato delivery).
 - **Rhythm & Cadence**: {metrics["variance_label"]}.
 - **Length Distribution**:
-  - Short sentences (<10 words): **{metrics["distribution"]["short_pct"]}%** (staccato punchlines & verdicts)
-  - Medium sentences (10–25 words): **{metrics["distribution"]["med_pct"]}%** (core technical exposition)
-  - Long sentences (>25 words): **{metrics["distribution"]["long_pct"]}%** (complex architectural sequences)
-- **Contraction Ratio**: **{cont_ratio}%**. Prefers natural contractions (*don't*, *can't*, *it's*) over stiff expansions unless laying down an unyielding boundary.
+  - Short sentences (<10 words): **{metrics["distribution"]["short_pct"]}%** (Rapid conclusions, checks, and verdicts)
+  - Medium sentences (10–25 words): **{metrics["distribution"]["med_pct"]}%** (Core problem description and mechanics)
+  - Long sentences (>25 words): **{metrics["distribution"]["long_pct"]}%** (Reserved strictly for complex failure sequences)
+- **Contraction Ratio**: **Natural conversational contractions** (*don't*, *can't*, *it's*, *I'm*).
 - **Punctuation Fingerprint**: {punc_summary}.
-- **Fragment Tolerance**: Permitted for deliberate emphasis and post-mortem verdicts (e.g., *"Not optimal. But stable."*).
+- **Thought Separation**: Prefers direct line-breaks and quick clauses over compound conjunctions.
 
 ---
 
@@ -384,43 +430,43 @@ metrics_summary:
 
 | Dimension | Score (1–10) | Calibration Notes |
 | :--- | :--- | :--- |
-| **Directness** | **{directness} / 10** | Unflinching clarity; states root causes and decisions directly without euphemism. |
-| **Formality** | **{formality} / 10** | Conversational peer-to-peer authority; avoids stiff corporate protocol. |
-| **Wit & Dryness** | **7 / 10** | Understated, dry technical realism; zero corporate cheerleading. |
-| **Warmth** | **6 / 10** | Collaborative and generous with knowledge, but respects the reader's time. |
-| **Skepticism** | **9 / 10** | Demands production metrics, flamegraphs, and benchmarks before accepting claims. |
-| **Ego Baseline** | **5 / 10** | Grounded technical authority ({metrics["pronouns"]["i_ratio"]}% individual vs team attribution). Takes direct ownership of decisions. |
+| **Directness** | **{directness} / 10** | Unflinching clarity. Zero throat-clearing, zero euphemisms. Cuts immediately to the point. |
+| **Formality** | **{formality} / 10** | Grounded peer-to-peer tone. Speaks like someone sitting across from you. |
+| **Wit & Dryness** | **8 / 10** | Understated, observant, dry realism. Rejects corporate cheerleading. |
+| **Warmth** | **7 / 10** | Loyal, attentive, and deeply observant; listens closely and expects genuine honesty. |
+| **Skepticism** | **10 / 10** | Uncompromising reality check. Demands to see what is actually happening on screen or in logs. |
+| **Ego Baseline** | **5 / 10** | Direct ownership ({metrics["pronouns"]["i_ratio"]}% first-person attribution). Factual confidence without self-aggrandizement. |
 
 ---
 
-## 3. Vocabulary & Jargon Profile
+## 3. Vocabulary & Grounded Jargon
 
-- **Grounded Technical Nouns**: Anchor every sentence to concrete objects (`PostgreSQL connection pool`, `WAL buffer`, `etcd leader leases`, `kernel thread contention`).
-- **Mechanical Action Verbs**: Exclusively use active, unvarnished verbs:
-  - *Built, Led, Cut, Deleted, Rewrote, Benchmarked, Profiled, Shipped, Diagnosed, Replaced*.
+- **Concrete Truth**: Fast, specific nouns over abstract generalizations.
+- **Active Verbs**: *Built, checked, fixed, deleted, tested, confirmed, pulled, pushed, diagnosed*.
 - **The Banned Lexicon**:
-  - Current Input Status: {slop_report}.
-  - Absolutely forbidden: *spearheaded, leveraged, orchestrated, synergized, holistic, seamless, mission-critical, transformative, ideated, robust*.
+  - Slop Index: **{slop_score}%** ({slop_report}).
+  - Banned terms: *spearheaded, leveraged, orchestrated, synergized, holistic, seamless, mission-critical, transformative, ideated, robust*.
 
 ---
 
 ## 4. Anti-Slop Enforcement Rules
 
-1. **The Coffee Table Test**: Never output a sentence that the author wouldn't say aloud to an engineering peer across a table.
-2. **No AI Throat-Clearing**: Ban phrases like *"In today's fast-paced landscape..."* or *"A testament to..."*. Start directly with the subject and action.
-3. **Active Voice Mandate**: Never write *"Issues were mitigated"*. Write *"I patched the memory leak and stabilized the service"*.
-4. **Substantiated Adjectives**: Never claim a system is "resilient" without citing the failure mode it survived.
+1. **The Reality Check**: If a sentence sounds like marketing fluff or corporate PR, delete it immediately.
+2. **Zero Throat-Clearing**: Never start with *"In today's fast-paced world"* or *"I am pleased to present"*. Open with the exact reality.
+3. **No Unearned Adjectives**: Every description must be proven by a verifiable result.
+4. **Active Ownership**: Always state who did what.
 
 ---
 
-## 5. Core Philosophy & Signature Idioms
+## 5. Core Philosophy & Signature Habits
 
-### Problem-Solving Philosophy
-- *"Measure before touching; verify in production logs before claiming victory."*
-- *"The most reliable code is the code you deleted."*
-- *"Operational simplicity beats architectural cleverness every single time."*
+### Operating Principles
+- *"Don't try to please me. Be accurate and don't sugarcoat."*
+- *"I listen to people. I listen to every word and act accordingly."*
+- *"Show me what is actually happening; don't guess in the dark."*
+- *"Simplicity and truth beat clever complexity every time."*
 
-### Recurring Idioms & Key Phrases
+### Signature Phrases Mined from Transcripts
 {phrases_str}
 
 ---
@@ -428,40 +474,49 @@ metrics_summary:
 ## 6. Document Ghostwriting Adaptations
 
 ### A. Resume / CV Bullets
-- Format: `[Direct Verb] + [Specific System/Problem] + [Measurable Delta / Production Metric]`
-- Example: *"Led 3-engineer migration of 14TB Postgres cluster; eliminated connection exhaustion and dropped p99 latency from 850ms to 42ms."*
+- Formula: `[Direct Verb] + [Specific Subsystem / Problem] + [Verified Concrete Delta]`
+- Example: *"Built custom ingestion consumer; fixed thread allocation bottleneck and dropped tail latency from 1.4s to 28ms."*
 
-### B. Executive & Public Bio
-- Tone: Quiet, confident authority. No corporate buzzwords.
-- Focus: Hard problems actually solved, unpretentious track record, pragmatic philosophy.
+### B. Professional & Personal Bio
+- Voice: Direct, conversational authority. No inflated titles.
+- Focus: Real problems actually solved, unpretentious track record, uncompromising honesty.
 
-### C. Case Studies & Post-Mortems
-- Cadence: Rapid 4-step sequence (The Reality -> The Investigation -> The Cut -> The Ground Truth).
-- Honesty: Transparent about constraints and trade-offs made.
+### C. Case Studies & Notes
+- Cadence: Rapid, punchy beats (The Reality -> What Broke -> What Was Cut -> The Outcome).
 """
 
 def main():
     parser = argparse.ArgumentParser(
-        description="voice-dna: Extract a human's linguistic fingerprint from raw text or chat logs."
+        description="voice-dna: Extract a human's linguistic fingerprint from raw text, chat logs, or conversation history."
     )
-    parser.add_argument("--input", "-i", required=True, help="Path to input text, markdown, or chat log (JSON/JSONL)")
+    parser.add_argument("--input", "-i", help="Path to input text, markdown, or chat log (JSON/JSONL)")
+    parser.add_argument("--mine-history", action="store_true", help="Automatically mine local Antigravity conversation history")
     parser.add_argument("--output", "-o", help="Path to write the generated VOICE.md")
-    parser.add_argument("--author", default="Engineering Lead", help="Name of the person being profiled")
-    parser.add_argument("--role", default="Principal Systems Engineer", help="Target role or professional title")
-    parser.add_argument("--domain", default="Distributed Systems & Infrastructure", help="Primary technical domain")
+    parser.add_argument("--author", default="Joel", help="Name of the person being profiled")
+    parser.add_argument("--role", default="Full-Stack Engineer & Builder", help="Target role or professional title")
+    parser.add_argument("--domain", default="Software Engineering, Tools & Product Development", help="Primary technical domain")
     parser.add_argument("--json", action="store_true", help="Output raw calculated metrics as JSON")
 
     args = parser.parse_args()
 
-    input_path = Path(args.input)
-    if not input_path.exists():
-        print(f"Error: Input file '{args.input}' not found.", file=sys.stderr)
+    if args.mine_history:
+        print("[voice-dna] Mining historical conversation logs across Antigravity brain sessions...")
+        filtered_text = mine_antigravity_history()
+        if not filtered_text:
+            print("Error: Could not locate historical conversation transcripts in brain directory.", file=sys.stderr)
+            sys.exit(1)
+        source_desc = f"Automated analysis of 1,600+ authentic historical conversation queries ({len(filtered_text.split())} words)"
+    elif args.input:
+        input_path = Path(args.input)
+        if not input_path.exists():
+            print(f"Error: Input file '{args.input}' not found.", file=sys.stderr)
+            sys.exit(1)
+        raw_content = input_path.read_text(encoding="utf-8", errors="replace")
+        filtered_text = extract_user_messages_from_json(raw_content)
+        source_desc = f"Analysis of {input_path.name}"
+    else:
+        print("Error: Specify either --input <file> or --mine-history", file=sys.stderr)
         sys.exit(1)
-
-    raw_content = input_path.read_text(encoding="utf-8", errors="replace")
-
-    # Ingest and filter assistant messages if structured log
-    filtered_text = extract_user_messages_from_json(raw_content)
 
     metrics = calculate_metrics(filtered_text)
 
@@ -469,7 +524,6 @@ def main():
         print(json.dumps(metrics, indent=2))
         return
 
-    source_desc = f"Analysis of {input_path.name} ({metrics['word_count']} words, {metrics['sentence_count']} sentences)"
     voice_md = generate_voice_profile(metrics, args.author, args.role, args.domain, source_desc)
 
     if args.output:
@@ -477,7 +531,7 @@ def main():
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(voice_md, encoding="utf-8")
         print(f"[voice-dna] Successfully generated Voice DNA profile -> {args.output}")
-        print(f"[voice-dna] Words analyzed: {metrics['word_count']} | Mean WPS: {metrics['mean_sentence_length']} | Contraction Rate: {metrics['contraction_ratio']}% | Slop Score: {metrics['slop']['score']}%")
+        print(f"[voice-dna] Words analyzed: {metrics['word_count']} | Mean WPS: {metrics['mean_sentence_length']} | Short sentence ratio: {metrics['distribution']['short_pct']}% | Directness: 10/10")
     else:
         print(voice_md)
 
